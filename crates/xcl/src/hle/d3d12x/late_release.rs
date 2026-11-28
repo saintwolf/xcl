@@ -155,7 +155,7 @@ pub unsafe fn hold(res: usize, pinned: bool) {
             std::hint::spin_loop();
             drain_known(false);
         }
-        if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+        if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) && !super::vram::pending_recycles() {
             return;
         }
         BUSY.found(Instant::now());
@@ -228,6 +228,7 @@ pub fn hold_unmap(res: ID3D12Resource) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    super::vram::drain_recycled();
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
@@ -267,9 +268,13 @@ pub unsafe fn drain_known(seal_now: bool) {
         super::sparse::forget_buffer(res);
         super::placements::gone(res);
         super::small_tex::gone(res);
+        if super::vram::recycle_ready(res) {
+            continue;
+        }
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
+    super::vram::drain_recycled();
 }
 
 #[cfg(test)]

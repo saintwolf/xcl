@@ -387,17 +387,19 @@ impl Table {
     }
 
     /// Remove `res` on COM release, reactivating any shadowed older textures it uncovered (newest
-    /// first). Returns `(was_present, pending_delta, unmapped_res_to_remap)`.
-    fn remove(&mut self, res: usize) -> (bool, isize, Vec<usize>) {
+    /// first). Returns `(was_present, pending_delta, unmapped_res_to_remap, uniform_state)`.
+    fn remove(&mut self, res: usize) -> (bool, isize, Vec<usize>, Option<D3D12_RESOURCE_STATES>) {
         if let Some(old) = self.shadowed.remove(&res) {
             self.shadowed_by_va.remove(&(old.va, res));
             if self.shadowed.is_empty() {
                 self.max_shadowed_size = 0;
             }
-            return (true, 0, Vec::new());
+            let st = (old.states.len() == 1).then(|| old.states[0]);
+            return (true, 0, Vec::new(), st);
         }
-        let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
+        let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new(), None) };
         self.unlink_src(res, old.src, old.tex.size() as usize);
+        let st = (old.states.len() == 1).then(|| old.states[0]);
         self.by_va.remove(&(old.va, res));
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
@@ -439,7 +441,7 @@ impl Table {
         if self.shadowed.is_empty() {
             self.max_shadowed_size = 0;
         }
-        (true, pending_delta, to_remap)
+        (true, pending_delta, to_remap, st)
     }
 
     fn get_mut(&mut self, res: usize) -> Option<&mut Entry> {
@@ -1025,15 +1027,16 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     }
 }
 
-/// The PC texture was released for good.
-pub fn forget(res: usize) {
+/// The PC texture was released for good. Returns its last tracked uniform D3D12 resource state
+/// when all subresources shared a single state (used by `vram` to recycle reserved textures safely).
+pub fn forget(res: usize) -> Option<D3D12_RESOURCE_STATES> {
     STREAM_RECHECK.lock().unwrap().remove(&res);
-    let (removed, to_remap) = {
+    let (removed, to_remap, state) = {
         let mut t = TEXTURES.lock().unwrap();
-        let (removed, delta, remap_ptrs) = t.remove(res);
+        let (removed, delta, remap_ptrs, state) = t.remove(res);
         adjust_pending(delta);
         update_lengths(&t);
-        (removed, unsafe { clone_resources(&remap_ptrs) })
+        (removed, unsafe { clone_resources(&remap_ptrs) }, state)
     };
     for r in &to_remap {
         unsafe {
@@ -1047,6 +1050,7 @@ pub fn forget(res: usize) {
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
+    state
 }
 
 /// The title-memory address of a texture kept in step with it.
@@ -6026,12 +6030,12 @@ pub(super) mod tests {
         assert_eq!((delta, unmap), (0, vec![1, 2, 20]));
         assert!(tbl.by_res.contains_key(&3) && tbl.by_res.contains_key(&4));
         // Releasing 4 uncovers newest non-overlapping shadowed entries (1 and 20) and requests remap.
-        let (removed, delta, mut remap) = tbl.remove(4);
+        let (removed, delta, mut remap, _) = tbl.remove(4);
         remap.sort_unstable();
         assert_eq!((removed, delta, remap), (true, 1, vec![1, 20]));
         assert!(tbl.by_res.contains_key(&1) && tbl.by_res.contains_key(&20) && tbl.shadowed.contains_key(&2));
         // Releasing 20 uncovers 2; releasing middle of a 3-chain still uncovers oldest when top goes.
-        let (removed, _, remap) = tbl.remove(20);
+        let (removed, _, remap, _) = tbl.remove(20);
         assert_eq!((removed, remap), (true, vec![2]));
         assert!(tbl.by_res.contains_key(&2));
         assert_eq!(tbl.insert(5, entry(0x10_8000, &tex_64k, true, true)).0, 1);
