@@ -312,7 +312,12 @@ fn translate_on_this_thread(
         }
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
-            if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
+            let total = cs.threads.iter().try_fold(1u32, |a, &b| a.checked_mul(b)).unwrap_or(0);
+            if split && !uses_lds && cs.threads == [64, 1, 1] {
+                split_tid = Some(tid);
+            } else if !o.wave64 && !uses_lds && cs.threads[1] * cs.threads[2] > 1 && total > 32 && total % 32 == 0 {
+                split_tid = Some(tid);
+            }
             group_runs = Some(compute_init(&mut lw, cs, tid, gtid));
             cs.threads
         }
@@ -764,11 +769,13 @@ impl Lw {
         }
         let stage = self.s.stage;
         let mut dispatch_chain = None;
+        let total = numthreads.iter().try_fold(1u32, |a, &b| a.checked_mul(b)).unwrap_or(0);
+        let native_w32 = !self.wave64 && !self.split && self.lds.is_none() && total >= 32 && total % 32 == 0;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
-        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+        } else if limit > 0 && (native_w32 || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
             // A single split wave64 meets its other half through group-shared counters its entry
             // zeroes (`Partner::Spin`), and the exchange's running number counts from the

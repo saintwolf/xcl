@@ -87,11 +87,16 @@ impl Scratch {
 }
 
 impl Shader {
-    /// Start with full native wave32 groups. A fresh dispatch can assign a
-    /// different physical wave to a group; wave-lane index identifies the
-    /// continuation within a full, single-wave group.
+    /// Partition a full-wave compute entry into a dispatch chain. Single-wave
+    /// native wave32 groups identify continuations by `WaveGetLaneIndex()`,
+    /// 1-D multi-wave native wave32 groups by `FlattenedThreadIdInGroup()`, and
+    /// 2-D/3-D multi-wave or split-wave64 groups by replaying their `tid` prefix.
     pub(crate) fn split_compute(&self, threads: [u32; 3], split_tid: Option<Value>, limit: usize) -> Option<DispatchChain> {
-        if self.m.globals.iter().any(|g| !g.constant && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs"))) {
+        let total = threads[0].checked_mul(threads[1])?.checked_mul(threads[2])?;
+        if total == 0 {
+            return None;
+        }
+        if self.m.globals.iter().any(|g| !g.constant && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs" | "xcl_wt"))) {
             return None;
         }
         if self.m.blocks.iter().map(Vec::len).sum::<usize>() <= limit { return None; }
@@ -100,6 +105,7 @@ impl Shader {
             let end = self.m.blocks[0].iter().position(|&i| Value::Inst(i) == tid)?;
             prefix.extend_from_slice(&self.m.blocks[0][..=end]);
         }
+        let has_xs = split_tid.is_some() && self.m.globals.iter().any(|g| g.name == "xcl_xs");
         let mut consumed = HashSet::new();
         for &i in self.m.blocks.iter().flatten() {
             self.m.insts[i as usize].op.for_each_operand(|v| { consumed.insert(v); });
@@ -113,11 +119,11 @@ impl Shader {
                 if b == 0 && prefix.contains(&i) { continue; }
                 match &self.m.insts[i as usize].op {
                     Op::Alloca(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => return None,
-                    Op::Store(..) if split_tid.is_some() && exchange <= 1 => exchange = 1,
+                    Op::Store(..) if has_xs && exchange <= 1 => exchange = 1,
                     Op::Load(p, _) if self.m.global_root(*p).is_some_and(|g| self.m.globals[g].constant) => {}
-                    Op::Load(..) if split_tid.is_some() && matches!(exchange, 2 | 3) => exchange = 3,
+                    Op::Load(..) if has_xs && matches!(exchange, 2 | 3) => exchange = 3,
                     Op::Load(..) | Op::Store(..) => return None,
-                    Op::Call(f, args) if self.m.funcs[*f as usize].name == "dx.op.barrier"
+                    Op::Call(f, args) if has_xs && self.m.funcs[*f as usize].name == "dx.op.barrier"
                             && self.m.const_u64(args[1]) == Some(crate::gpu::dxil::ops::barrier::GROUP_SYNC as u64) => {
                         exchange = match exchange { 1 => 2, 3 => 0, _ => return None };
                     }
@@ -148,12 +154,12 @@ impl Shader {
         if cfg!(test) && std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
             (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
         }
-        stride.checked_mul(threads[0])?.checked_mul(4)?;
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
-        Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
+        stride.checked_mul(total)?.checked_mul(4)?;
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, total, &prefix)).collect::<Option<Vec<_>>>()?;
+        Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(total)? })
     }
 
-    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32]) -> Option<Vec<u8>> {
+    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], total: u32, prefix: &[u32]) -> Option<Vec<u8>> {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
@@ -165,8 +171,11 @@ impl Shader {
             let v = dst.m.push(op, def.ty);
             values.insert(Value::Inst(id), slab.group_id(src, &def.op, &mut dst.m, v));
         }
-        let lane = prefix.last().map(|&i| values[&Value::Inst(i)]).unwrap_or_else(|| dst.wave_lane_index());
-        let scratch = Scratch::new(&mut dst, &slab, stride, threads[0], lane);
+        let lane = prefix
+            .last()
+            .map(|&i| values[&Value::Inst(i)])
+            .unwrap_or_else(|| if total == 32 { dst.wave_lane_index() } else { dst.flattened_thread_id_in_group() });
+        let scratch = Scratch::new(&mut dst, &slab, stride, total, lane);
         let local: HashMap<_, _> = plan.blocks[stage].iter().map(|&b| (b, dst.m.new_block())).collect();
         let mut hops = HashMap::new();
         let mut exits = HashMap::new();
@@ -283,7 +292,7 @@ impl Shader {
 
     fn infer_piece_features(&mut self) {
         for f in [Feature::Doubles, Feature::Int64Ops, Feature::DoubleExtensions,
-                  Feature::ResourceHeapIndexing, Feature::SamplerHeapIndexing] {
+                  Feature::ResourceHeapIndexing, Feature::SamplerHeapIndexing, Feature::WaveOps] {
             self.features.remove(&f);
         }
         // typed UAV loads (`texture_load` without a mip): the whole program's flag stays only on
@@ -293,12 +302,15 @@ impl Shader {
             Op::Call(f, args) if self.m.funcs[*f as usize].name.starts_with("dx.op.textureLoad") && uav_load(args, &self.m))) {
             self.features.remove(&Feature::TypedUavLoadAdditionalFormats);
         }
-        for def in &self.m.insts {
-            if let Op::Call(f, args) = &def.op {
-                if self.m.funcs[*f as usize].name == "dx.op.createHandleFromHeap" {
+        for &i in self.m.blocks.iter().flatten() {
+            if let Op::Call(f, args) = &self.m.insts[i as usize].op {
+                let name = &self.m.funcs[*f as usize].name;
+                if name == "dx.op.createHandleFromHeap" {
                     self.features.insert(if self.m.const_u64(args[2]) == Some(0) {
                         Feature::ResourceHeapIndexing
                     } else { Feature::SamplerHeapIndexing });
+                } else if name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad") {
+                    self.features.insert(Feature::WaveOps);
                 }
             }
         }
@@ -1213,6 +1225,180 @@ mod tests {
                 }
                 println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
             }
+        }
+    }
+
+    /// Single-wave 2D/3D native groups (`total <= lanes`, e.g. `[8, 4, 1]`, `[4, 4, 2]` wave32
+    /// and `[8, 8, 1]` native wave64) need no `xcl_wt` groupshared counter or barriers.
+    /// Multi-wave 2D/3D native wave32 groups (`[8, 8, 1]`) still emit `xcl_wt` with one barrier
+    /// when not sharing `xcl_lds`, and reject splitting if a guest barrier appears outside the prefix.
+    #[test]
+    fn single_wave_2d_3d_omits_xcl_wt_and_guest_barrier_declines_split() {
+        for (geometry, wave64) in [([8, 4, 1], false), ([4, 4, 2], false), ([8, 8, 1], true)] {
+            let cs = CsInterface { threads: geometry, ..Default::default() };
+            let options = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let (tid, gtid) = lw.setup_lanes_compute(geometry, false);
+            let mem = lw.mems[0];
+            let offset = lw.shlc(tid, 2);
+            let sum = lw.add(gtid[0], gtid[1]);
+            let sum = lw.add(sum, gtid[2]);
+            lw.s.raw_store(mem, offset, &[sum]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+            assert!(
+                lw.s.m.globals.iter().all(|g| g.name != "xcl_wt"),
+                "{geometry:?} wave64={wave64} should not emit xcl_wt"
+            );
+            let has_barrier = lw.s.m.blocks.iter().flatten().any(|&i| {
+                matches!(&lw.s.m.insts[i as usize].op, super::Op::Call(f, _) if lw.s.m.funcs[*f as usize].name == "dx.op.barrier")
+            });
+            assert!(!has_barrier, "{geometry:?} wave64={wave64} should not emit a barrier");
+            let dxil = lw.s.finish_optimized(geometry, Some(if wave64 { 64 } else { 32 })).unwrap();
+            crate::gpu::dxil::validate::validate(&dxil).expect("valid single-wave 2D/3D shader");
+        }
+
+        // Negative control: a multi-wave `[8, 8, 1]` native wave32 shader with a guest barrier
+        // outside the `xcl_wt` prefix must stay whole.
+        let geometry = [8, 8, 1];
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        let mut v = lw.s.raw_load(mem, offset, 1)[0];
+        for round in 1..=20u32 {
+            let b = lw.s.m.new_block();
+            lw.s.m.br(b);
+            lw.s.m.set_block(b);
+            v = lw.addc(v, round);
+            if round == 10 {
+                lw.s.barrier(crate::gpu::dxil::ops::barrier::GROUP_SYNC);
+            }
+        }
+        lw.s.raw_store(mem, offset, &[v]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        assert!(lw.s.m.globals.iter().any(|g| g.name == "xcl_wt"));
+        assert!(lw.s.split_compute(geometry, Some(tid), 16).is_none());
+    }
+
+    /// Native wave32 dispatch splitting across single-wave 2D/3D (`[8, 4, 1]`, `[4, 4, 2]`),
+    /// multi-wave 2D (`[8, 8, 1]` with `xcl_wt` prefix), and multi-wave 1D (`[128, 1, 1]`):
+    /// every piece validates and GPU readback matches the whole shader and CPU reference
+    /// across a 3D dispatch grid with loops, divergent branches, `(gx, gy, gz)`, and wave ops.
+    #[test]
+    fn dispatch_chain_native_wave32_group_shapes_match_whole() {
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        for (geometry, grid) in [
+            ([8, 4, 1], [2, 2, 1]),
+            ([4, 4, 2], [2, 1, 2]),
+            ([8, 8, 1], [2, 2, 1]),
+            ([128, 1, 1], [2, 1, 1]),
+        ] {
+            let total: u32 = geometry.iter().product();
+            let groups: u32 = grid.iter().product();
+            let cs = CsInterface { threads: geometry, ..Default::default() };
+            let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let (tid, [gx, gy, gz]) = lw.setup_lanes_compute(geometry, false);
+            let split_tid = (geometry[1] * geometry[2] > 1 && total > 32).then_some(tid);
+            let mem = lw.mems[0];
+            let [wx, wy, wz] = [0, 1, 2].map(|axis| lw.s.group_id(axis));
+            let gy_dim = lw.c(grid[1]);
+            let gx_dim = lw.c(grid[0]);
+            let row = lw.mul(wz, gy_dim);
+            let row = lw.add(row, wy);
+            let group = lw.mul(row, gx_dim);
+            let group = lw.add(group, wx);
+            let count = lw.c(total);
+            let base = lw.mul(group, count);
+            let index = lw.add(base, tid);
+            let offset = lw.shlc(index, 2);
+            let original = lw.s.raw_load(mem, offset, 1)[0];
+            // Encode `(gx, gy, gz)` so any thread-coordinate mismatch fails immediately.
+            let gy8 = lw.shlc(gy, 4);
+            let gz16 = lw.shlc(gz, 8);
+            let coord_tag = lw.or(gx, gy8);
+            let coord_tag = lw.or(coord_tag, gz16);
+            let mut value = lw.xor(original, coord_tag);
+            let zero = lw.c(0);
+            let i32 = lw.s.m.i32();
+            let mode = lw.andc(tid, 3);
+            let trips = lw.addc(mode, 1);
+            for round in 1..=12u32 {
+                let pred = lw.cur();
+                let body = lw.s.m.new_block();
+                let exit = lw.s.m.new_block();
+                lw.s.m.br(body);
+                lw.s.m.set_block(body);
+                let counter = lw.s.m.phi(i32);
+                let acc = lw.s.m.phi(i32);
+                lw.s.m.add_incoming(counter, zero, pred);
+                lw.s.m.add_incoming(acc, value, pred);
+                let next = lw.addc(counter, 1);
+                value = lw.add(acc, original);
+                value = lw.addc(value, round);
+                lw.s.m.add_incoming(counter, next, body);
+                lw.s.m.add_incoming(acc, value, body);
+                let again = lw.cmp(Pred::ULt, next, trips);
+                lw.s.m.cond_br(again, body, exit);
+                lw.s.m.set_block(exit);
+                if round == 6 {
+                    // Wave-local op in a middle piece: verifies wave membership survives the cut.
+                    let w0 = lw.s.wave_read_lane_first(tid);
+                    let wave_base = lw.andc(w0, !31);
+                    value = lw.add(value, wave_base);
+                }
+            }
+            lw.s.raw_store(mem, offset, &[value]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+
+            let chain = lw.s.split_compute(geometry, split_tid, 40).expect("split wave32 group");
+            assert!(chain.pieces.len() >= 3, "{geometry:?} expected >= 3 pieces, got {}", chain.pieces.len());
+            let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+            crate::gpu::dxil::validate::validate(&whole).expect("valid whole fixture");
+
+            let words = (total * groups) as usize;
+            let initial: Vec<u32> = (0..words).map(|i| (i as u32).wrapping_mul(17).wrapping_add(3)).collect();
+            let expected: Vec<u32> = initial
+                .iter()
+                .enumerate()
+                .map(|(idx, &orig)| {
+                    let t = idx as u32 % total;
+                    let tx = t % geometry[0];
+                    let ty = (t / geometry[0]) % geometry[1];
+                    let tz = t / (geometry[0] * geometry[1]);
+                    let tag = tx | (ty << 4) | (tz << 8);
+                    let n = (t & 3) + 1;
+                    let mut v = orig ^ tag;
+                    for round in 1..=12u32 {
+                        v = v.wrapping_add(n.wrapping_mul(orig.wrapping_add(round)));
+                        if round == 6 {
+                            v = v.wrapping_add(t & !31);
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let reference = runner::dispatch(&whole, grid, &[], &initial).unwrap();
+            assert_eq!(reference, expected, "whole {geometry:?}");
+            let result = runner::dispatch_split(&chain, grid, &initial).unwrap();
+            assert_eq!(result, expected, "split {geometry:?}");
+            for most in [1, 3, 7] {
+                let slabbed = runner::dispatch_split_by(&chain, grid, &initial, most).unwrap();
+                assert_eq!(slabbed, expected, "split {geometry:?}, {most} groups at once");
+            }
+            println!(
+                "CHAIN_W32 geometry={geometry:?} grid={grid:?} pieces={} scratch_words_per_group={}",
+                chain.pieces.len(),
+                chain.dwords_per_group
+            );
         }
     }
 
