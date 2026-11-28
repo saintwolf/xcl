@@ -592,3 +592,39 @@ float4 main(V v) : SV_Target0 { return v.p0; }
         eprintln!("{REPLAY_SKIP}");
     }
 }
+
+#[test]
+fn mixed_mesh_preparation_keeps_supported_variants() {
+    if let Err(reason) = dxc::location() {
+        runner::skip_test(&format!("no DXC: {reason}"));
+        return;
+    }
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = TempDir(std::env::temp_dir().join(format!("xcl-mixed-ms-{}-{nonce}", std::process::id())));
+    fs::create_dir(&root.0).unwrap();
+    let input = root.0.join("input");
+    fs::create_dir(&input).unwrap();
+    let file = input.join("mixed.dxbc");
+    let code = [0x01, 0x03, 0x80, 0xbe, 0x01, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+    let mut incomplete = code;
+    incomplete[..4].copy_from_slice(&0x7e00_1d00u32.to_le_bytes()); // v_cvt_off_f32_i4
+    let stage = [(7, 13)];
+    let dxil = dxil_part(13, &[fssm(&incomplete, &stage), fssm(&code, &stage)]);
+    let psv = mesh_psv(3, 1, [128, 1, 1], [64, 64]);
+    fs::write(&file, container(&[(b"SFI0", &[0; 8]), (b"HASH", &[0; 20]), (b"DXIL", &dxil), (b"PSV0", &psv), (b"PRIV", &[7; 16])])).unwrap();
+    for (compiled, cached) in [(2, 0), (0, 2)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders").arg(&input).args(["--precompile", "--only", "MS", "--split", "1"])
+            .env("XCL_DXIL_CACHE", root.0.join("cache")).env("XCL_DIRECT_DXIL", "all")
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains(&format!("compiled {compiled}, already cached {cached}, errors 0")), "{text}");
+    }
+}

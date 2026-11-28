@@ -1449,6 +1449,16 @@ fn console_mesh_with(
     finish_two_pass_compiled(cs, record, ps)
 }
 
+/// The mesh-shader (NGG) program of a console MS container for explicit `windows` (used by
+/// offline / startup precompilation to populate the exact same `translated/v2` and DXIL caches
+/// as `console_mesh`).
+pub fn console_mesh_in(blob: &[u8], split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
+    let dir = dxc::cache_dir();
+    console_mesh_with(blob, None, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
+        compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
+    })
+}
+
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {

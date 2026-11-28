@@ -82,17 +82,27 @@ pub fn scan(d: &[u8], from: usize) -> Vec<Record> {
     out
 }
 
+/// Inflate a raw deflate slice to `expected` bytes. `None` when the stream is not valid deflate.
+pub fn inflate_slice(compressed: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let unpacked = miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, expected).ok()?;
+    (unpacked.len() == expected).then_some(unpacked)
+}
+
 /// Inflate a record. `None` when the stream is not valid deflate.
 pub fn inflate(d: &[u8], r: &Record) -> Option<Vec<u8>> {
     let end = r.data.checked_add(r.csize)?;
     let compressed = d.get(r.data..end)?;
-    let unpacked = miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, r.usize).ok()?;
-    (unpacked.len() == r.usize).then_some(unpacked)
+    inflate_slice(compressed, r.usize)
 }
 
 /// Stage prefix of a shader name (`PS_Foo` → `PS`, `effect:CS_Foo` → `CS`).
+/// Requires an explicit `_` separator and non-empty suffix so names like `Asset01` do not collide
+/// with `AS`.
 pub fn name_stage(name: &str) -> Option<&'static str> {
     let base = name.rsplit(':').next()?;
+    if base.as_bytes().get(2) != Some(&b'_') || base.len() <= 3 {
+        return None;
+    }
     let up = base.get(..2)?.to_ascii_uppercase();
     ["PS", "VS", "MS", "GS", "CS", "HS", "DS", "AS"].into_iter().find(|s| *s == up)
 }
@@ -129,6 +139,11 @@ mod tests {
         assert_eq!(recs[0].flag, 50);
         assert_eq!(name_stage(&recs[0].name), Some("PS"));
         assert_eq!(name_stage("ptfx_x"), None);
+        assert_eq!(name_stage("Asset01"), None);
+        assert_eq!(name_stage("asset_pixel"), None);
+        assert_eq!(name_stage("CS_"), None);
+        assert_eq!(name_stage("fx:cs_Test"), Some("CS"));
+        assert_eq!(name_stage("CS_Test"), Some("CS"));
     }
 
     /// An effect-qualified name is one record under its full name, also when the `:` byte
